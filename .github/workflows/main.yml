@@ -1,0 +1,26 @@
+name: Bot Crypto 15m
+on:
+  schedule:
+    - cron: '*/15 * * * *' # Esto es cada 15 min exactos
+  workflow_dispatch:      # Esto te permite probarlo manualmente
+
+jobs:
+  ejecutar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clonar codigo
+        uses: actions/checkout@v3
+
+      - name: Instalar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Correr Bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python copia_de_actalizacion_xnyusdt(1).py # <-- CAMBIA ESTO por el nombre real de tu .py

@@ -114,7 +114,7 @@ def run_prediction_cycle():
             print(f"Probabilidad detectada (15min): {highest_proba:.2%}")
 
             # Condición de activación: > 70%
-            if highest_proba > 0.70:
+            if highest_proba > 0.40:
                 precio = df_now['close'].iloc[0]
                 bogota_now = df_now.index[0].tz_localize('UTC').astimezone(pytz.timezone('America/Bogota'))
 

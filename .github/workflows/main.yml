@@ -1,26 +1,28 @@
-name: Bot Crypto 15m
+name: Bot Predictor XNY
 on:
   schedule:
-    - cron: '*/15 * * * *' # Esto es cada 15 min exactos
-  workflow_dispatch:      # Esto te permite probarlo manualmente
+    - cron: '*/15 * * * *'  # Se ejecuta cada 15 minutos
+  workflow_dispatch:       # Botón para ejecutar manualmente
 
 jobs:
-  ejecutar:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: Clonar codigo
+      - name: Checkout del código
         uses: actions/checkout@v3
 
-      - name: Instalar Python
+      - name: Configurar Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
 
-      - name: Instalar dependencias
-        run: pip install -r requirements.txt
+      - name: Instalar librerías
+        run: |
+          pip install -r requirements.txt
 
-      - name: Correr Bot
+      - name: Ejecutar Script de Predicción
         env:
+          # ESTA ES LA PARTE CLAVE: Conecta GitHub con tu código
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python copia_de_actalizacion_xnyusdt(1).py # <-- CAMBIA ESTO por el nombre real de tu .py
+        run: python copia_de_actalizacion_xnyusdt(1).py

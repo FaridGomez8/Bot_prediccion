@@ -22,7 +22,6 @@ jobs:
 
       - name: Ejecutar Script de Predicción
         env:
-          # ESTA ES LA PARTE CLAVE: Conecta GitHub con tu código
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python copia_de_actalizacion_xnyusdt(1).py

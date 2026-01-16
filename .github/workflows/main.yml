@@ -1,4 +1,4 @@
-name: Bot Predictor XNY
+name: Bot Predictor BTC
 on:
   schedule:
     - cron: '*/15 * * * *'  # Se ejecuta cada 15 minutos

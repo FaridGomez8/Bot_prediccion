@@ -12,7 +12,7 @@ from sklearn.metrics import accuracy_score
 SYMBOL = 'BTC-USDT'
 TIME_FRAMES = ['5min', '15min', '1hour', '4hour']
 TF_PRINCIPAL = '15min'
-UMBRAL_PROBABILIDAD = 0.10  # MODO PRUEBA AL 10%
+UMBRAL_PROBABILIDAD = 0.70 
 ZONA_HORARIA = pytz.timezone('America/Bogota')
 
 def get_kucoin_klines(symbol, timeframe):
@@ -35,17 +35,21 @@ def get_kucoin_klines(symbol, timeframe):
 
 def add_technical_indicators(df):
     df = df.copy()
-    # INDICADORES BASE
+    
+    # 1. INDICADORES BASE
     df['EMA_55'] = ta.trend.ema_indicator(df['close'], window=55)
     df['DIST_EMA'] = (df['close'] - df['EMA_55']) / df['EMA_55']
     df['RSI'] = ta.momentum.rsi(df['close'], window=14)
     bb = ta.volatility.BollingerBands(df['close'], window=20)
     df['BBL_PERC'] = bb.bollinger_pband()
     
-    # FILTROS DE CALIDAD (MFI corregido en ta.volume)
+    # 2. FILTROS DE CALIDAD (CORRECCIÓN MFI)
     adx_obj = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14)
     df['ADX'] = adx_obj.adx()
+    
+    # CAMBIO AQUÍ: MFI está en ta.volume, no en ta.momentum
     df['MFI'] = ta.volume.money_flow_index(df['high'], df['low'], df['close'], df['volume'], window=14)
+    
     df['ATR'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=14)
     df['ATR_NORM'] = df['ATR'] / df['close'] 
     
@@ -63,7 +67,7 @@ def send_telegram_alert(message):
 
 def run_prediction_cycle():
     results = {}
-    print(f"--- Ejecutando Ciclo de PRUEBA (10%) para {SYMBOL} ---")
+    print(f"--- Ejecutando ciclo completo para {SYMBOL} ---")
 
     for tf in TIME_FRAMES:
         df = get_kucoin_klines(SYMBOL, tf)
@@ -107,10 +111,9 @@ def run_prediction_cycle():
         prob_final = res_p['prob'] if es_subida else (1 - res_p['prob'])
         direccion = "Subir 📈" if es_subida else "Bajar 📉"
 
-        # Para la prueba, eliminamos temporalmente el filtro de ADX > 20
-        if prob_final >= UMBRAL_PROBABILIDAD:
+        if prob_final >= UMBRAL_PROBABILIDAD and res_p['adx'] > 20:
             confluencia_1h = (results['1hour']['prob'] >= 0.5) == es_subida
-            meta_label = "🧪 MODO PRUEBA (10%)"
+            meta_label = "💎 SEÑAL DE ALTA CONFLUENCIA" if confluencia_1h else "⚠️ SEÑAL INDIVIDUAL"
 
             resumen_otros = ""
             for tf, r in results.items():

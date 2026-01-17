@@ -16,7 +16,6 @@ UMBRAL_PROBABILIDAD = 0.70
 ZONA_HORARIA = pytz.timezone('America/Bogota')
 
 def get_kucoin_klines(symbol, timeframe):
-    """Obtiene datos de Kucoin y asegura el orden cronológico."""
     endpoint = 'https://api.kucoin.com/api/v1/market/candles'
     params = {'symbol': symbol, 'type': timeframe}
     try:
@@ -27,7 +26,6 @@ def get_kucoin_klines(symbol, timeframe):
             df['timestamp'] = pd.to_datetime(df['timestamp'].astype(int), unit='s')
             for col in ['open', 'close', 'high', 'low', 'volume']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-            # Ordenar de más antiguo a más reciente para cálculos correctos
             df = df.sort_values('timestamp', ascending=True)
             return df.set_index('timestamp')
         return None
@@ -36,69 +34,58 @@ def get_kucoin_klines(symbol, timeframe):
         return None
 
 def add_technical_indicators(df):
-    """Añade indicadores base y filtros de confirmación avanzados."""
     df = df.copy()
     
-    # 1. INDICADORES BASE (Anteriores)
+    # 1. INDICADORES BASE
     df['EMA_55'] = ta.trend.ema_indicator(df['close'], window=55)
     df['DIST_EMA'] = (df['close'] - df['EMA_55']) / df['EMA_55']
     df['RSI'] = ta.momentum.rsi(df['close'], window=14)
     bb = ta.volatility.BollingerBands(df['close'], window=20)
     df['BBL_PERC'] = bb.bollinger_pband()
     
-    # 2. FILTROS NUEVOS (Confirmación de tendencia y volumen)
-    # ADX: Fuerza de la tendencia
+    # 2. FILTROS DE CALIDAD (CORRECCIÓN MFI)
     adx_obj = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14)
     df['ADX'] = adx_obj.adx()
     
-    # MFI: Money Flow Index (RSI + Volumen)
-    df['MFI'] = ta.momentum.money_flow_index(df['high'], df['low'], df['close'], df['volume'], window=14)
+    # CAMBIO AQUÍ: MFI está en ta.volume, no en ta.momentum
+    df['MFI'] = ta.volume.money_flow_index(df['high'], df['low'], df['close'], df['volume'], window=14)
     
-    # ATR Normalizado: Volatilidad relativa
     df['ATR'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=14)
     df['ATR_NORM'] = df['ATR'] / df['close'] 
     
     return df.dropna()
 
 def send_telegram_alert(message):
-    """Envía la alerta a Telegram usando variables de entorno."""
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHAT_ID')
-    if not token or not chat_id:
-        print("⚠️ Faltan credenciales de Telegram.")
-        return
+    if not token or not chat_id: return
     url = f"https://api.telegram.org/bot{token}/sendMessage?chat_id={chat_id}&parse_mode=Markdown&text={message}"
     try:
         requests.get(url)
-    except Exception as e:
-        print(f"Error enviando Telegram: {e}")
+    except:
+        pass
 
 def run_prediction_cycle():
     results = {}
-    print(f"--- Ejecutando ciclo de análisis completo para {SYMBOL} ---")
+    print(f"--- Ejecutando ciclo completo para {SYMBOL} ---")
 
     for tf in TIME_FRAMES:
         df = get_kucoin_klines(SYMBOL, tf)
         if df is not None and len(df) > 60:
             df_ind = add_technical_indicators(df)
-            
-            # Target: ¿El precio de la siguiente vela cerró por encima?
             df_ind['target'] = (df_ind['close'].shift(-1) > df_ind['close']).astype(int)
             df_ind.dropna(inplace=True)
 
-            # Características seleccionadas para el modelo
             features = ['RSI', 'DIST_EMA', 'BBL_PERC', 'ADX', 'MFI', 'ATR_NORM']
             X = df_ind[features]
             y = df_ind['target']
 
-            # Entrenamiento con validación temporal
             split = int(len(X) * 0.8)
             scaler = RobustScaler()
             X_train = scaler.fit_transform(X.iloc[:split])
             X_test = scaler.transform(X.iloc[split:])
             y_train, y_test = y.iloc[:split], y.iloc[split:]
 
-            # Random Forest optimizado
             model = RandomForestClassifier(n_estimators=200, max_depth=7, random_state=42)
             model.fit(X_train, y_train)
             
@@ -106,7 +93,6 @@ def run_prediction_cycle():
             last_row = df_ind.tail(1)
             prob_up = model.predict_proba(scaler.transform(last_row[features]))[0][1]
             
-            # Convertir marca de tiempo de la vela a Bogotá
             ts_utc = last_row.index[0].tz_localize('UTC')
             ts_bogota = ts_utc.astimezone(ZONA_HORARIA)
 
@@ -119,21 +105,16 @@ def run_prediction_cycle():
                 'timestamp_marca': ts_bogota.strftime('%H:%M:%S')
             }
 
-    # Procesar Alerta Principal
     if TF_PRINCIPAL in results:
         res_p = results[TF_PRINCIPAL]
         es_subida = res_p['prob'] >= 0.5
         prob_final = res_p['prob'] if es_subida else (1 - res_p['prob'])
         direccion = "Subir 📈" if es_subida else "Bajar 📉"
 
-        # FILTRO DE CALIDAD: Probabilidad > 70% y ADX > 20 (Tendencia confirmada)
         if prob_final >= UMBRAL_PROBABILIDAD and res_p['adx'] > 20:
-            
-            # Lógica de confluencia con temporalidad mayor (1h)
             confluencia_1h = (results['1hour']['prob'] >= 0.5) == es_subida
             meta_label = "💎 SEÑAL DE ALTA CONFLUENCIA" if confluencia_1h else "⚠️ SEÑAL INDIVIDUAL"
 
-            # Construir resumen de temporalidades con marca de tiempo de Bogotá
             resumen_otros = ""
             for tf, r in results.items():
                 if tf != TF_PRINCIPAL:
@@ -141,7 +122,6 @@ def run_prediction_cycle():
                     prob_tf = r['prob'] if r['prob'] >= 0.5 else (1 - r['prob'])
                     resumen_otros += f"- *{tf}:* {icon} ({prob_tf:.2%}) | 🕒 Marca: {r['timestamp_marca']}\n"
 
-            # Hora actual del sistema en Bogotá
             hora_actual = pd.Timestamp.now(tz='UTC').astimezone(ZONA_HORARIA).strftime('%H:%M:%S')
 
             msg = (f"{meta_label}\n\n"
@@ -155,9 +135,6 @@ def run_prediction_cycle():
                    f"⏰ *Hora de Alerta:* {hora_actual}")
             
             send_telegram_alert(msg)
-            print("Señal enviada a Telegram.")
-        else:
-            print(f"Filtros no superados: Prob {prob_final:.2%}, ADX {res_p['adx']:.1f}")
 
 if __name__ == "__main__":
     run_prediction_cycle()

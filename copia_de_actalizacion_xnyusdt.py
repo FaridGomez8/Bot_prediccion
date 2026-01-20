@@ -13,6 +13,7 @@ SYMBOL = 'BTC-USDT'
 TIME_FRAMES = ['5min', '15min', '1hour', '4hour']
 TF_PRINCIPAL = '15min'
 UMBRAL_PROBABILIDAD = 0.70 
+MIN_CONFIANZA_MODELO = 0.60 # Tu observación: Filtro de 60%
 ZONA_HORARIA = pytz.timezone('America/Bogota')
 
 def get_kucoin_klines(symbol, timeframe):
@@ -29,29 +30,33 @@ def get_kucoin_klines(symbol, timeframe):
             df = df.sort_values('timestamp', ascending=True)
             return df.set_index('timestamp')
         return None
-    except Exception as e:
-        print(f"Error capturando datos: {e}")
-        return None
+    except Exception: return None
 
 def add_technical_indicators(df):
     df = df.copy()
     
-    # 1. INDICADORES BASE
+    # INDICADORES EXISTENTES
     df['EMA_55'] = ta.trend.ema_indicator(df['close'], window=55)
     df['DIST_EMA'] = (df['close'] - df['EMA_55']) / df['EMA_55']
     df['RSI'] = ta.momentum.rsi(df['close'], window=14)
-    bb = ta.volatility.BollingerBands(df['close'], window=20)
-    df['BBL_PERC'] = bb.bollinger_pband()
-    
-    # 2. FILTROS DE CALIDAD (CORRECCIÓN MFI)
     adx_obj = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14)
     df['ADX'] = adx_obj.adx()
-    
-    # CAMBIO AQUÍ: MFI está en ta.volume, no en ta.momentum
     df['MFI'] = ta.volume.money_flow_index(df['high'], df['low'], df['close'], df['volume'], window=14)
     
-    df['ATR'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=14)
-    df['ATR_NORM'] = df['ATR'] / df['close'] 
+    # --- NUEVOS INDICADORES PARA PRECISIÓN ---
+    # 1. Williams %R (Ayuda a ver si el movimiento fuerte terminó)
+    df['WILLR'] = ta.momentum.williams_r(df['high'], df['low'], df['close'], lbp=14)
+    
+    # 2. Estocástico (Para filtrar rebotes falsos)
+    stoch = ta.momentum.StochasticOscillator(df['high'], df['low'], df['close'], window=14, smooth_window=3)
+    df['STOCH_K'] = stoch.stoch()
+    
+    # 3. OBV (Volumen acumulado para confirmar tendencia)
+    df['OBV'] = ta.volume.on_balance_volume(df['close'], df['volume'])
+    df['OBV_ROC'] = df['OBV'].pct_change(periods=5) # Cambio porcentual del volumen
+    
+    # 4. ATR Normalizado (Volatilidad)
+    df['ATR_NORM'] = ta.volatility.average_true_range(df['high'], df['low'], df['close']) / df['close']
     
     return df.dropna()
 
@@ -60,14 +65,12 @@ def send_telegram_alert(message):
     chat_id = os.environ.get('TELEGRAM_CHAT_ID')
     if not token or not chat_id: return
     url = f"https://api.telegram.org/bot{token}/sendMessage?chat_id={chat_id}&parse_mode=Markdown&text={message}"
-    try:
-        requests.get(url)
-    except:
-        pass
+    try: requests.get(url)
+    except: pass
 
 def run_prediction_cycle():
     results = {}
-    print(f"--- Ejecutando ciclo completo para {SYMBOL} ---")
+    features = ['RSI', 'DIST_EMA', 'ADX', 'MFI', 'WILLR', 'STOCH_K', 'OBV_ROC', 'ATR_NORM']
 
     for tf in TIME_FRAMES:
         df = get_kucoin_klines(SYMBOL, tf)
@@ -76,7 +79,6 @@ def run_prediction_cycle():
             df_ind['target'] = (df_ind['close'].shift(-1) > df_ind['close']).astype(int)
             df_ind.dropna(inplace=True)
 
-            features = ['RSI', 'DIST_EMA', 'BBL_PERC', 'ADX', 'MFI', 'ATR_NORM']
             X = df_ind[features]
             y = df_ind['target']
 
@@ -86,7 +88,7 @@ def run_prediction_cycle():
             X_test = scaler.transform(X.iloc[split:])
             y_train, y_test = y.iloc[:split], y.iloc[split:]
 
-            model = RandomForestClassifier(n_estimators=200, max_depth=7, random_state=42)
+            model = RandomForestClassifier(n_estimators=250, max_depth=10, random_state=42)
             model.fit(X_train, y_train)
             
             acc = accuracy_score(y_test, model.predict(X_test))
@@ -94,15 +96,9 @@ def run_prediction_cycle():
             prob_up = model.predict_proba(scaler.transform(last_row[features]))[0][1]
             
             ts_utc = last_row.index[0].tz_localize('UTC')
-            ts_bogota = ts_utc.astimezone(ZONA_HORARIA)
-
             results[tf] = {
-                'prob': prob_up, 
-                'acc': acc, 
-                'price': df_ind['close'].iloc[-1],
-                'adx': last_row['ADX'].iloc[0],
-                'mfi': last_row['MFI'].iloc[0],
-                'timestamp_marca': ts_bogota.strftime('%H:%M:%S')
+                'prob': prob_up, 'acc': acc, 'price': df_ind['close'].iloc[-1],
+                'adx': last_row['ADX'].iloc[0], 'timestamp_marca': ts_utc.astimezone(ZONA_HORARIA).strftime('%H:%M:%S')
             }
 
     if TF_PRINCIPAL in results:
@@ -111,28 +107,23 @@ def run_prediction_cycle():
         prob_final = res_p['prob'] if es_subida else (1 - res_p['prob'])
         direccion = "Subir 📈" if es_subida else "Bajar 📉"
 
-        if prob_final >= UMBRAL_PROBABILIDAD and res_p['adx'] > 20:
-            confluencia_1h = (results['1hour']['prob'] >= 0.5) == es_subida
-            meta_label = "💎 SEÑAL DE ALTA CONFLUENCIA" if confluencia_1h else "⚠️ SEÑAL INDIVIDUAL"
-
-            resumen_otros = ""
-            for tf, r in results.items():
-                if tf != TF_PRINCIPAL:
-                    icon = "⬆️" if r['prob'] >= 0.5 else "⬇️"
-                    prob_tf = r['prob'] if r['prob'] >= 0.5 else (1 - r['prob'])
-                    resumen_otros += f"- *{tf}:* {icon} ({prob_tf:.2%}) | 🕒 Marca: {r['timestamp_marca']}\n"
-
+        # --- FILTROS DE ALTA EXIGENCIA ---
+        mismo_sentido = (results['1hour']['prob'] >= 0.5) == es_subida
+        
+        # CONDICIÓN: Probabilidad > 70% Y Confianza > 60% Y Confluencia con 1H
+        if prob_final >= UMBRAL_PROBABILIDAD and res_p['acc'] >= MIN_CONFIANZA_MODELO and mismo_sentido:
+            
+            meta_label = "💎 SEÑAL DE ALTA CONFLUENCIA"
             hora_actual = pd.Timestamp.now(tz='UTC').astimezone(ZONA_HORARIA).strftime('%H:%M:%S')
 
             msg = (f"{meta_label}\n\n"
                    f"🔮 *Predicción ({TF_PRINCIPAL}):* *{direccion}*\n"
                    f"🎯 *Probabilidad:* {prob_final:.2%}\n"
                    f"📊 *Confianza Modelo:* {res_p['acc']:.2%}\n"
-                   f"🕒 *Marca Vela {TF_PRINCIPAL}:* {res_p['timestamp_marca']}\n\n"
+                   f"🕒 *Vela:* {res_p['timestamp_marca']}\n\n"
                    f"💪 *Fuerza (ADX):* {res_p['adx']:.1f}\n"
                    f"💰 *Precio Actual:* {res_p['price']:.2f}\n\n"
-                   f"🌐 *Contexto Temporal (Bogotá):*\n{resumen_otros}\n"
-                   f"⏰ *Hora de Alerta:* {hora_actual}")
+                   f"⏰ *Hora Bogotá:* {hora_actual}")
             
             send_telegram_alert(msg)
 

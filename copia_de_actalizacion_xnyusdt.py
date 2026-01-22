@@ -9,10 +9,9 @@ from sklearn.preprocessing import RobustScaler
 
 # --- CONFIGURACIÓN ---
 SYMBOL = 'BTC-USDT'
-# Incluimos 1day para tener el panorama macro completo
 TIME_FRAMES = ['5min', '15min', '1hour', '4hour', '1day']
 TF_PRINCIPAL = '15min'
-UMBRAL_PROBABILIDAD = 0.65  # Bajamos de 0.70 a 0.65 para captar movimientos más rápido
+UMBRAL_PROBABILIDAD = 0.65 
 ZONA_HORARIA = pytz.timezone('America/Bogota')
 
 def get_kucoin_klines(symbol, timeframe):
@@ -33,19 +32,20 @@ def get_kucoin_klines(symbol, timeframe):
 
 def add_technical_indicators(df):
     df = df.copy()
-    # Tendencia Rápida (EMA 9) e Intermedia (EMA 55)
+    # Medias Móviles
     df['EMA_9'] = ta.trend.ema_indicator(df['close'], window=9)
     df['EMA_55'] = ta.trend.ema_indicator(df['close'], window=55)
     
-    # Indicadores Clave de Decisión
+    # Fuerza y Tendencia
     df['RSI'] = ta.momentum.rsi(df['close'], window=14)
     df['ADX'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
     
-    # Distancia a la EMA 55 (Para saber si el precio está muy estirado o iniciando tendencia)
-    df['DIST_EMA'] = (df['close'] - df['EMA_55']) / df['EMA_55']
+    # Volatilidad (ATR) - Clave para movimientos grandes
+    df['ATR'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=14)
+    df['ATR_NORM'] = df['ATR'] / df['close'] 
     
-    # Volumen
-    df['OBV'] = ta.volume.on_balance_volume(df['close'], df['volume'])
+    # Distancia a la EMA 55
+    df['DIST_EMA'] = (df['close'] - df['EMA_55']) / df['EMA_55']
     
     return df.dropna()
 
@@ -59,29 +59,26 @@ def send_telegram_alert(message):
 
 def run_prediction_cycle():
     results = {}
-    # Simplificamos a las características que realmente importan en tendencia
-    features = ['RSI', 'DIST_EMA', 'ADX']
+    # Añadimos ATR_NORM para que la IA aprenda a detectar grandes volatilidades
+    features = ['RSI', 'DIST_EMA', 'ADX', 'ATR_NORM']
 
     for tf in TIME_FRAMES:
         df = get_kucoin_klines(SYMBOL, tf)
         if df is not None and len(df) > 60:
             df_ind = add_technical_indicators(df)
-            
-            # Etiqueta: ¿La siguiente vela cerró arriba?
-            df_ind['target'] = (df_ind['close'].shift(-1) > df_ind['close']).astype(int)
+            # Para capturar movimientos GRANDES, la IA ahora mira 2 velas adelante
+            df_ind['target'] = (df_ind['close'].shift(-2) > df_ind['close']).astype(int)
             df_ind.dropna(inplace=True)
 
             X = df_ind[features]
             y = df_ind['target']
 
-            # Entrenamiento rápido (Random Forest con menos profundidad para evitar sobreajuste)
             scaler = RobustScaler()
             X_scaled = scaler.fit_transform(X)
             
-            model = RandomForestClassifier(n_estimators=100, max_depth=7, random_state=42)
+            model = RandomForestClassifier(n_estimators=150, max_depth=8, random_state=42)
             model.fit(X_scaled, y)
             
-            # Predicción de la vela actual
             last_row = df_ind.tail(1)
             prob_up = model.predict_proba(scaler.transform(last_row[features]))[0][1]
             
@@ -90,6 +87,7 @@ def run_prediction_cycle():
                 'prob': prob_up, 
                 'price': df_ind['close'].iloc[-1],
                 'ema_9': last_row['EMA_9'].iloc[0],
+                'rsi': last_row['RSI'].iloc[0],
                 'adx': last_row['ADX'].iloc[0],
                 'timestamp_marca': ts_utc.astimezone(ZONA_HORARIA).strftime('%H:%M')
             }
@@ -100,18 +98,26 @@ def run_prediction_cycle():
         prob_final = res_p['prob'] if es_subida else (1 - res_p['prob'])
         direccion = "Subir 📈" if es_subida else "Bajar 📉"
 
-        # --- LÓGICA DE FILTRADO SENSIBLE ---
-        # 1. Confluencia con 1 Hora (Obligatoria)
-        mismo_sentido = (results['1hour']['prob'] >= 0.5) == es_subida
+        # --- LÓGICA DE FILTRADO PARA GRANDES MOVIMIENTOS ---
         
-        # 2. Filtro de Tendencia EMA 9 (Precio debe estar del lado correcto de la media rápida)
+        # 1. Confluencia con 1H y 4H (Obligatoria para filtrar ruiditos)
+        conf_1h = (results['1hour']['prob'] >= 0.5) == es_subida
+        conf_4h = (results['4hour']['prob'] >= 0.5) == es_subida
+        
+        # 2. Filtro de Tendencia EMA 9
         filtro_ema = (es_subida and res_p['price'] > res_p['ema_9']) or \
                      (not es_subida and res_p['price'] < res_p['ema_9'])
 
-        # Solo enviamos si cumple probabilidad, confluencia y el precio ya rompió la EMA 9
-        if prob_final >= UMBRAL_PROBABILIDAD and mismo_sentido and filtro_ema:
+        # 3. FRENOS DE AGOTAMIENTO (Evita entrar al final del movimiento)
+        filtro_agotamiento = True
+        if not es_subida and res_p['rsi'] < 38: # No vender si ya está muy abajo
+            filtro_agotamiento = False
+        elif es_subida and res_p['rsi'] > 62: # No comprar si ya está muy arriba
+            filtro_agotamiento = False
+
+        # Solo enviamos si pasa los 3 filtros y hay confluencia extendida
+        if prob_final >= UMBRAL_PROBABILIDAD and conf_1h and conf_4h and filtro_ema and filtro_agotamiento:
             
-            # Construir el resumen de todas las temporalidades
             contexto_msg = ""
             for tf in ['5min', '1hour', '4hour', '1day']:
                 if tf in results:
@@ -122,9 +128,10 @@ def run_prediction_cycle():
 
             hora_actual = pd.Timestamp.now(tz='UTC').astimezone(ZONA_HORARIA).strftime('%H:%M:%S')
 
-            msg = (f"💎 *ALTA CONFLUENCIA DETECTADA*\n\n"
+            msg = (f"💎 *ALERTA DE TENDENCIA FUERTE*\n\n"
                    f"🎯 *Predicción {TF_PRINCIPAL}:* {direccion}\n"
                    f"🔥 *Probabilidad:* {prob_final:.1%}\n"
+                   f"📉 *RSI Actual:* {res_p['rsi']:.1f}\n"
                    f"💪 *Fuerza ADX:* {res_p['adx']:.1f}\n\n"
                    f"🌐 *Contexto Multitemporal:*\n{contexto_msg}\n"
                    f"⏰ *Hora Bogotá:* {hora_actual}")
